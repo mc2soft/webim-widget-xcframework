@@ -11,6 +11,13 @@
 #   Scripts/build-and-release.sh 2.0.4        # собрать конкретную версию
 #   Scripts/build-and-release.sh --publish    # собрать и выложить релиз
 #
+# Фреймворки подписываются сертификатом из переменной CODESIGN_IDENTITY — имя
+# или SHA-1 сертификата Apple Distribution из связки ключей. Без подписи
+# App Store Connect отклоняет сборку с ITMS-91065: SnapKit в списке
+# commonly used third-party SDK, а бинарные зависимости из него обязаны быть подписаны.
+#
+#   CODESIGN_IDENTITY="Apple Distribution: …" Scripts/build-and-release.sh
+#
 # Требуются: xcodegen (brew install xcodegen) и gh для публикации.
 #
 set -euo pipefail
@@ -18,7 +25,7 @@ set -euo pipefail
 readonly REPO_URL="https://github.com/webim/webim-mobile-ui-ios"
 readonly GITHUB_REPO="mc2soft/webim-widget-xcframework"
 readonly CODE_FRAMEWORK="WebimWidgetBundle"   # динамический фреймворк со всем кодом
-readonly DEPLOYMENT_TARGET="13.0"
+readonly DEPLOYMENT_TARGET="18.0"
 
 readonly ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 readonly BUILD_DIR="$ROOT/build"
@@ -47,6 +54,14 @@ fi
 
 command -v xcodegen > /dev/null || {
 	echo "error: не найден xcodegen — установите: brew install xcodegen" >&2; exit 1
+}
+[ -n "${CODESIGN_IDENTITY:-}" ] || {
+	echo "error: не задан CODESIGN_IDENTITY — сертификат Apple Distribution для подписи фреймворков" >&2
+	exit 1
+}
+security find-identity -v -p codesigning | grep -qF "$CODESIGN_IDENTITY" || {
+	echo "error: в связке ключей нет действующего сертификата «$CODESIGN_IDENTITY»" >&2
+	exit 1
 }
 if [ "$PUBLISH" = yes ]; then
 	command -v gh > /dev/null || {
@@ -217,9 +232,14 @@ assemble_platform "$WORK/dd-device" Release-iphoneos        iphoneos        ios-
 assemble_platform "$WORK/dd-sim"    Release-iphonesimulator iphonesimulator ios-arm64_x86_64-simulator \
 	"arm64-apple-ios$DEPLOYMENT_TARGET-simulator x86_64-apple-ios$DEPLOYMENT_TARGET-simulator"
 
-# --- 4. xcframework и архивы ----------------------------------------------
+# --- 4. xcframework, подпись и архивы -------------------------------------
 
-echo "==> Собираю xcframework"
+sign() {
+	codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$1"
+	codesign --verify --strict "$1"
+}
+
+echo "==> Собираю и подписываю xcframework"
 rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
 names=()
 for path in "$WORK/frameworks/ios-arm64"/*.framework; do
@@ -229,6 +249,14 @@ for path in "$WORK/frameworks/ios-arm64"/*.framework; do
 		-framework "$WORK/frameworks/ios-arm64/$name.framework" \
 		-framework "$WORK/frameworks/ios-arm64_x86_64-simulator/$name.framework" \
 		-output "$WORK/$name.xcframework" > /dev/null
+	# Подписывать нужно и каждый срез, а не только обёртку: Xcode встраивает в
+	# приложение фреймворк из среза, и неподписанный срез даёт ITMS-91065.
+	# Срезы подписываются уже внутри xcframework: -create-xcframework выбрасывает
+	# бинарные .swiftmodule, и подпись, сделанная до него, становится невалидной.
+	for slice in "$WORK/$name.xcframework"/*/*.framework; do
+		sign "$slice"
+	done
+	sign "$WORK/$name.xcframework"
 	# ditto, а не zip: внутри фреймворков есть симлинки, обычный zip их ломает
 	ditto -c -k --sequesterRsrc --keepParent \
 		"$WORK/$name.xcframework" "$BUILD_DIR/$name.xcframework.zip"
@@ -243,14 +271,14 @@ asset_url() { echo "https://github.com/$GITHUB_REPO/releases/download/$VERSION/$
 
 echo "==> Генерирую Package.swift"
 {
-	echo "// swift-tools-version:5.9"
+	echo "// swift-tools-version:6.0"
 	echo "// Сгенерировано Scripts/build-and-release.sh — не редактировать вручную."
 	echo "// WebimMobileWidget $VERSION"
 	echo "import PackageDescription"
 	echo
 	echo "let package = Package("
 	echo "	name: \"WebimWidget\","
-	echo "	platforms: [ .iOS(.v13) ],"
+	echo "	platforms: [ .iOS(.v${DEPLOYMENT_TARGET%%.*}) ],"
 	echo "	products: ["
 	echo "		.library( name: \"WebimWidget\", targets: ["
 	for name in "${names[@]}"; do echo "			\"$name\","; done

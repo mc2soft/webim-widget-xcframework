@@ -1,3 +1,4 @@
 # Собранные бинарники — они уезжают в GitHub Releases, а не в git.
 build/
 .DS_Store
+.build/
